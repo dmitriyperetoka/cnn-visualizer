@@ -2,7 +2,7 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
-#include <cstdlib>
+#include <format>
 
 torch::Tensor bgr_to_rgb(torch::Tensor bgr) {
   torch::TensorOptions options = torch::TensorOptions().device(bgr.device()).dtype(bgr.dtype());
@@ -147,7 +147,7 @@ int main(int argc, char *argv[]) {
     cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0, cv::Size(1280, 720));
     std::string cmd{
         "ffmpeg "
-        "-loglevel quiet "
+        "-loglevel error "
         "-hwaccel cuda "
         "-vcodec h264_cuvid "
         "-i "
@@ -182,7 +182,6 @@ int main(int argc, char *argv[]) {
         torch::Tensor scores;
         torch::Tensor classes;
         std::tie(boxes, scores, classes) = postprocess(output[0], classes_to_keep, min_score, 640, 640);
-        //std::cout << boxes << std::endl << scores << std::endl << classes << std::endl << std::endl;
 
         cv::Mat mat = cv::Mat(cv::Size(1280, 720), CV_8UC3, frame.data_ptr<uchar>());
         for (int i = 0; i < boxes.sizes()[0]; ++i) {
@@ -193,7 +192,7 @@ int main(int argc, char *argv[]) {
         count++;
     }
     writer.release();
-    std::cout << count << std::endl;
+    std::cout << std::format("{}", count) << std::endl;
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;
