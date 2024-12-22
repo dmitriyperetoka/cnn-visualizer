@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/tensorrt:24.10-py3
+FROM nvcr.io/nvidia/tensorrt:24.12-py3
 
 WORKDIR /code
 
@@ -7,13 +7,15 @@ RUN apt-get install -y ffmpeg
 RUN pip install --upgrade pip
 RUN pip install --upgrade cmake
 
-RUN git clone --single-branch --branch main --recursive https://github.com/Microsoft/onnxruntime onnxruntime
+RUN git clone --single-branch --branch rel-1.20.1 --recursive https://github.com/Microsoft/onnxruntime onnxruntime
 RUN /bin/sh onnxruntime/dockerfiles/scripts/install_common_deps.sh
 RUN /bin/sh onnxruntime/dockerfiles/scripts/checkout_submodules.sh ${TRT_VERSION:0:3}
 RUN cd onnxruntime && \
-    /bin/sh build.sh --allow_running_as_root --build_shared_lib --cuda_home /usr/local/cuda --cudnn_home /usr/lib/x86_64-linux-gnu/ \
-    --use_tensorrt --tensorrt_home /usr/lib/x86_64-linux-gnu/ --config Release --skip_tests --skip_submodule_sync &&\
-    cd ..
+    /bin/sh build.sh --allow_running_as_root --build_shared_lib \
+    --use_cuda --cuda_home /usr/local/cuda --cudnn_home /usr/lib/x86_64-linux-gnu \
+    --use_tensorrt --tensorrt_home /usr/lib/x86_64-linux-gnu \
+    --config Release --skip_tests --skip_submodule_sync && \
+    cd -
 RUN cd onnxruntime/build/Linux/Release && \
     make install && \
     cd -
