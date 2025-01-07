@@ -3,6 +3,7 @@
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <format>
+#include <unordered_map>
 
 torch::Tensor bgr_to_rgb(torch::Tensor bgr) {
   torch::TensorOptions options = torch::TensorOptions().device(bgr.device()).dtype(bgr.dtype());
@@ -129,35 +130,89 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> postprocess(
   return {boxes, scores, classes};
 }
 
+
+enum class ModelExecutionMode : char {CPU, CUDA, TENSORRT};
+
+
 int main(int argc, char *argv[]) {
   try {
+    if (argc < 4) {
+      std::cerr << "Required args: model_path, input_path, output_path" << std::endl;
+      return 1;
+    }
     std::string model_path(argv[1]);
     std::string input_path(argv[2]);
     std::string output_path(argv[3]);
+    ModelExecutionMode exec_mode{ModelExecutionMode::CPU};
+    if (argc > 4) {
+      std::string exec_mode_arg{argv[4]};
+      exec_mode = std::unordered_map<std::string, ModelExecutionMode>{
+        {"CPU", ModelExecutionMode::CPU},
+        {"CUDA", ModelExecutionMode::CUDA},
+        {"TENSORRT", ModelExecutionMode::TENSORRT}
+      }[exec_mode_arg];
+    }
 
     Ort::Env env;
-    Ort::MemoryInfo memory_info_cuda("Cuda", OrtArenaAllocator, /*device_id*/0, OrtMemTypeDefault);
+    Ort::MemoryInfo memory_info = 
+      (exec_mode == ModelExecutionMode::CPU)
+      ? Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)
+      : Ort::MemoryInfo("Cuda", OrtArenaAllocator, /*device_id*/0, OrtMemTypeDefault);
     Ort::SessionOptions options;
-    OrtTensorRTProviderOptions trt_opts;
-    trt_opts.trt_max_partition_iterations = 1000;
-    trt_opts.trt_min_subgraph_size = 1;
-    trt_opts.device_id = 0;
-    options.AppendExecutionProvider_TensorRT(trt_opts);
+
+    auto cuda_opts = std::make_unique<OrtCUDAProviderOptions>();
+    auto trt_opts = std::make_unique<OrtTensorRTProviderOptions>();
+    switch (exec_mode) 
+    {
+      case ModelExecutionMode::CUDA:
+        options.AppendExecutionProvider_CUDA(*cuda_opts.get());
+        break;
+      case ModelExecutionMode::TENSORRT:
+        trt_opts->trt_max_partition_iterations = 1000;
+        trt_opts->trt_min_subgraph_size = 1;
+        options.AppendExecutionProvider_TensorRT(*trt_opts.get());
+        break;
+      default:
+        break;
+    }
+
     Ort::Session session(env, model_path.c_str(), options);
+    Ort::AllocatorWithDefaultOptions ort_alloc;
+
+    size_t input_count = session.GetInputCount();
+    std::vector<const char*> input_names(input_count);
+    for (size_t i = 0; i < input_count; ++i) {
+      input_names[i] = strdup(session.GetInputNameAllocated(i, ort_alloc).get());
+    }
+
+    size_t output_count = session.GetOutputCount();
+    std::vector<const char*> output_names(output_count);
+    for (size_t i = 0; i < output_count; ++i) {
+      output_names[i] = strdup(session.GetOutputNameAllocated(i, ort_alloc).get());
+    }
+
+    std::array<int64_t, 4> input_shape = {1, 3, 640, 640};
+    torch::Tensor input = torch::zeros({1, 3, 640, 640}, torch::TensorOptions().dtype(torch::kFloat32));
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
+    torch::Tensor output = torch::zeros({1, 5, 8400}, torch::TensorOptions().dtype(torch::kFloat32));
+    std::array<int64_t, 4> output_shape = {1, 5, 8400};
+    Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info, output.data_ptr<float>(), output.numel(), output_shape.data(), 3);
+    session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
+
     cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0, cv::Size(1280, 720));
-    std::string cmd{
+    std::string cmd{std::format(
         "ffmpeg "
         "-loglevel error "
         "-hwaccel cuda "
         "-vcodec h264_cuvid "
-        "-i "
-        + input_path + " "
+        "-i {} "
         "-pix_fmt bgr24 "
         "-f rawvideo "
         "pipe:"
-    };
-    std::array<char, 2764800> buffer;
-    int count;
+    , input_path)};
+    size_t buff_size{3 * 720 * 1280};
+    std::vector<char> buffer(buff_size);
+    int count{0};
     std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
     if (!pipe) {
         throw std::runtime_error("popen() failed!");
@@ -166,18 +221,16 @@ int main(int argc, char *argv[]) {
     torch::Tensor classes_to_keep = torch::tensor({0});
     torch::Tensor min_score = torch::tensor(0.65);
     while (not std::feof(pipe.get())) {
-        std::fread(buffer.data(), 1, 2764800, pipe.get());
+        std::fread(buffer.data(), 1, buff_size, pipe.get());
         torch::Tensor frame = torch::from_blob(buffer.data(), {720, 1280, 3}, torch::TensorOptions().dtype(torch::kUInt8));
         Ort::RunOptions run_options;
         torch::Tensor input = preprocess_frames(frame.permute({2, 0, 1}).unsqueeze(0), 640, 640);
         std::array<int64_t, 4> input_shape = {1, 3, 640, 640};
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info_cuda, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
         torch::Tensor output = torch::zeros({1, 5, 8400}, torch::TensorOptions().dtype(torch::kFloat32));
         std::array<int64_t, 4> output_shape = {1, 5, 8400};
-        Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info_cuda, output.data_ptr<float>(), output.numel(), output_shape.data(), 3);
-        const char* input_names[] = {"images"};
-        const char* output_names[] = {"output0"};
-        session.Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, &output_tensor, 1);
+        Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info, output.data_ptr<float>(), output.numel(), output_shape.data(), 3);
+        session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
         torch::Tensor boxes;
         torch::Tensor scores;
         torch::Tensor classes;
