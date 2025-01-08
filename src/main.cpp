@@ -223,15 +223,16 @@ int main(int argc, char *argv[]) {
 
     cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0, cv::Size(1280, 720));
     std::string cmd{std::format(
-        "ffmpeg "
-        "-loglevel error "
-        "-hwaccel cuda "
-        "-vcodec h264_cuvid "
-        "-i {} "
-        "-pix_fmt bgr24 "
-        "-f rawvideo "
-        "pipe:"
-    , input_path)};
+      "ffmpeg "
+      "-loglevel error "
+      "{}"
+      "-i {} "
+      "-pix_fmt bgr24 "
+      "-f rawvideo "
+      "pipe:",
+      (torch::cuda::is_available()) ? "-hwaccel cuda -vcodec h264_cuvid " : "",
+      input_path
+    )};
     size_t buff_size{3 * 720 * 1280};
     std::vector<char> buffer(buff_size);
     int count{0};
