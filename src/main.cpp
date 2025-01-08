@@ -3,7 +3,6 @@
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <format>
-#include <unordered_map>
 #include <vector>
 #include <numeric>
 #include <rapidjson/document.h>
@@ -14,7 +13,7 @@
 #include "cnnvisualizer/utils.hpp"
 #include "cnnvisualizer/constants.hpp"
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
   try {
     if (argc < 4) {
       std::cerr << "Required args: model_path, input_path, output_path" << std::endl;
@@ -28,16 +27,14 @@ int main(int argc, char *argv[]) {
       std::string infer_mode_arg{argv[4]};
       std::string infer_mode_arg_unified(infer_mode_arg);
       std::transform(infer_mode_arg.begin(), infer_mode_arg.end(), infer_mode_arg_unified.begin(), ::toupper);
-      std::unordered_map<std::string, cnnv::InferMode> infer_mode_map{
-        {"CPU", cnnv::InferMode::CPU},
-        {"CUDA", cnnv::InferMode::CUDA},
-        {"TENSORRT", cnnv::InferMode::TENSORRT}
-      };
 
-      auto search = infer_mode_map.find(infer_mode_arg_unified);
-      if (search == infer_mode_map.end()) {
-        std::vector<std::string> keys(infer_mode_map.size());
-        std::transform(infer_mode_map.begin(), infer_mode_map.end(), keys.begin(), [](std::pair<std::string, cnnv::InferMode> a) {return a.first;});
+      auto search = cnnv::STRING_TO_INFER_MODE.find(infer_mode_arg_unified);
+      if (search == cnnv::STRING_TO_INFER_MODE.end()) {
+        std::vector<std::string> keys(cnnv::STRING_TO_INFER_MODE.size());
+        std::transform(
+          cnnv::STRING_TO_INFER_MODE.begin(),
+          cnnv::STRING_TO_INFER_MODE.end(),
+          keys.begin(), [](std::pair<std::string, cnnv::InferMode> a) {return a.first;});
         std::cerr << std::format(
           "Unknown infer mode: {}. Supported options: {}.\n",
           infer_mode_arg,
@@ -91,15 +88,14 @@ int main(int argc, char *argv[]) {
       output_names[i] = strdup(session.GetOutputNameAllocated(i, ort_alloc).get());
     }
 
-    std::vector<int64_t> input_shape = {1, 3, 640, 640};
-    torch::Tensor input = torch::zeros(input_shape, torch::TensorOptions().dtype(torch::kFloat32));
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), input_shape.size());
-
-    std::vector<int64_t> output_shape = {1, 5, 8400};
+    std::vector<int64_t> output_shape = cnnv::DEFAULT_OUTPUT_SHAPE;
     torch::Tensor output = torch::zeros(output_shape, torch::TensorOptions().dtype(torch::kFloat32));
     Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info, output.data_ptr<float>(), output.numel(), output_shape.data(), output_shape.size());
 
     // warmup
+    std::vector<int64_t> input_shape = cnnv::DEFAULT_INPUT_SHAPE;
+    torch::Tensor input = torch::zeros(input_shape, torch::TensorOptions().dtype(torch::kFloat32));
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), input_shape.size());
     session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
 
     std::string ffprobe_cmd{std::format(
@@ -136,27 +132,11 @@ int main(int argc, char *argv[]) {
     std::string ds{r_frame_rate.substr(fraction_pos + 1)};
     std::stringstream{ds} >> denominator;
     double frame_rate{static_cast<double>(numerator) / denominator};
-
-    std::unordered_map<std::string, std::string> codec2nvcodec{
-        {"av1", "av1_cuvid"},
-        {"h264", "h264_cuvid"},
-        {"x264", "h264_cuvid"},
-        {"hevc", "hevc_cuvid"},
-        {"x265", "hevc_cuvid"},
-        {"h265", "hevc_cuvid"},
-        {"mjpeg", "mjpeg_cuvid"},
-        {"mpeg1video", "mpeg1_cuvid"},
-        {"mpeg2video", "mpeg2_cuvid"},
-        {"mpeg4", "mpeg4_cuvid"},
-        {"vc1", "vc1_cuvid"},
-        {"vp8", "vp8_cuvid"},
-        {"vp9", "vp9_cuvid"},
-    };
     std::string video_decode_hwaccel_info;
     if (torch::cuda::is_available()) {
       std::string nv_codec;
-      auto it = codec2nvcodec.cbegin();
-      while (it != codec2nvcodec.cend()) {
+      auto it = cnnv::CODEC_TO_NVCODEC.cbegin();
+      while (it != cnnv::CODEC_TO_NVCODEC.cend()) {
         if (it->first == codec_name || it->second == codec_name) {
           nv_codec = it->second;
           break;
@@ -196,10 +176,10 @@ int main(int argc, char *argv[]) {
     while (not std::feof(ffmpeg_pipe.get())) {
       std::fread(buffer.data(), 1, buff_size, ffmpeg_pipe.get());
       torch::Tensor frame = torch::from_blob(buffer.data(), {frame_height, frame_width, frame_channels}, torch::TensorOptions().dtype(torch::kUInt8));
-      torch::Tensor input = cnnv::preprocess_frames(frame.permute({2, 0, 1}).unsqueeze(0), 640, 640);
-      Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
+      torch::Tensor input = cnnv::preprocess_frames(frame.permute({2, 0, 1}).unsqueeze(0), input_shape[2], input_shape[3]);
+      Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), input_shape.size());
       session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
-      std::tie(boxes, scores, classes) = cnnv::postprocess(output[0], classes_to_keep, min_score, 640, 640);
+      std::tie(boxes, scores, classes) = cnnv::postprocess(output[0], classes_to_keep, min_score, input_shape[2], input_shape[3]);
       cv::Mat mat = cv::Mat(cv::Size(frame_width, frame_height), CV_8UC3, frame.data_ptr<uchar>());
       for (size_t i = 0; i < boxes.sizes()[0]; ++i) {
         std::vector<int64_t> box = cnnv::box_rel2abs(boxes[i], frame_height, frame_width);
