@@ -7,9 +7,16 @@ find_package( onnxruntime REQUIRED )
 include_directories(  
   "/usr/local/include/onnxruntime"  
   ${OpenCV_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 link_directories( ${OpenCV_LIB_DIR} )
-add_executable( yet_another_app src/main.cpp )
+add_executable(
+  yet_another_app
+  src/main.cpp
+  src/preprocess.cpp
+  src/postprocess.cpp
+  src/utils.cpp
+)
 target_link_libraries(
   yet_another_app
   "/usr/local/lib/libonnxruntime.so"
