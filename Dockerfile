@@ -33,3 +33,15 @@ RUN cd opencv-4.10.0/build && \
 
 RUN wget https://download.pytorch.org/libtorch/nightly/cu126/libtorch-cxx11-abi-shared-with-deps-2.6.0.dev20241208%2Bcu126.zip
 RUN unzip libtorch-cxx11-abi-shared-with-deps-2.6.0.dev20241208+cu126.zip && rm libtorch-cxx11-abi-shared-with-deps-2.6.0.dev20241208+cu126.zip
+
+RUN git clone https://github.com/Tencent/rapidjson.git 
+RUN cd rapidjson && \
+    git submodule update --init && \
+    cd -
+RUN mkdir rapidjson/build && \
+    cd rapidjson/build && \
+    cmake .. && \
+    cd -
+RUN cd rapidjson/build && \
+    make install && \
+    cd -
