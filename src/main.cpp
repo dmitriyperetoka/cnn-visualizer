@@ -6,6 +6,9 @@
 #include <unordered_map>
 #include <vector>
 #include <numeric>
+#include "rapidjson/document.h"
+#include "rapidjson/writer.h"
+#include "rapidjson/stringbuffer.h"
 
 torch::Tensor bgr_to_rgb(const torch::Tensor& bgr) {
   torch::TensorOptions options = torch::TensorOptions().device(bgr.device()).dtype(bgr.dtype());
@@ -175,10 +178,10 @@ int main(int argc, char *argv[]) {
     }
 
     Ort::Env env;
-    Ort::MemoryInfo memory_info = 
+    Ort::MemoryInfo memory_info{ 
       (infer_mode == InferMode::CPU)
       ? Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)
-      : Ort::MemoryInfo("Cuda", OrtArenaAllocator, /*device_id*/0, OrtMemTypeDefault);
+      : Ort::MemoryInfo("Cuda", OrtArenaAllocator, /*device_id*/0, OrtMemTypeDefault)};
     Ort::SessionOptions options;
 
     auto cuda_opts = std::make_unique<OrtCUDAProviderOptions>();
@@ -212,16 +215,84 @@ int main(int argc, char *argv[]) {
       output_names[i] = strdup(session.GetOutputNameAllocated(i, ort_alloc).get());
     }
 
-    std::array<int64_t, 4> input_shape = {1, 3, 640, 640};
-    torch::Tensor input = torch::zeros({1, 3, 640, 640}, torch::TensorOptions().dtype(torch::kFloat32));
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
-    torch::Tensor output = torch::zeros({1, 5, 8400}, torch::TensorOptions().dtype(torch::kFloat32));
-    std::array<int64_t, 4> output_shape = {1, 5, 8400};
-    Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info, output.data_ptr<float>(), output.numel(), output_shape.data(), 3);
+    std::vector<int64_t> input_shape = {1, 3, 640, 640};
+    torch::Tensor input = torch::zeros(input_shape, torch::TensorOptions().dtype(torch::kFloat32));
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), input_shape.size());
+
+    std::vector<int64_t> output_shape = {1, 5, 8400};
+    torch::Tensor output = torch::zeros(output_shape, torch::TensorOptions().dtype(torch::kFloat32));
+    Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info, output.data_ptr<float>(), output.numel(), output_shape.data(), output_shape.size());
+
+    // warmup
     session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
 
-    cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30.0, cv::Size(1280, 720));
-    std::string cmd{std::format(
+    std::string ffprobe_cmd{std::format(
+      "ffprobe "
+      "-show_streams "
+      "-select_streams v "
+      "-print_format json "
+      "-loglevel error "
+      "{}",
+      input_path
+    )};
+    std::unique_ptr<FILE, decltype(&pclose)> ffprobe_pipe(popen(ffprobe_cmd.c_str(), "r"), pclose);
+    if (!ffprobe_pipe) throw std::runtime_error("popen() failed!");
+    std::stringstream ffprobe_ss;
+    std::array<char, 1> ffprobe_buf;
+    while (not std::feof(ffprobe_pipe.get())) {
+      std::fread(ffprobe_buf.data(), 1, 1, ffprobe_pipe.get());
+      ffprobe_ss << ffprobe_buf[0];
+    }
+
+    rapidjson::Document d;
+    d.Parse(ffprobe_ss.str().c_str());
+    rapidjson::Value& stream_info = d["streams"][0];
+
+    std::string codec_name{stream_info["codec_name"].GetString()};
+    int frame_width{stream_info["width"].GetInt()};
+    int frame_height{stream_info["height"].GetInt()};
+    std::string r_frame_rate{stream_info["r_frame_rate"].GetString()};
+
+    int numerator, denominator;
+    size_t fraction_pos{r_frame_rate.find('/')};
+    std::string ns{r_frame_rate.substr(0, fraction_pos)};
+    std::stringstream{ns} >> numerator;
+    std::string ds{r_frame_rate.substr(fraction_pos + 1)};
+    std::stringstream{ds} >> denominator;
+    double frame_rate{static_cast<double>(numerator) / denominator};
+
+    std::unordered_map<std::string, std::string> codec2nvcodec{
+        {"av1", "av1_cuvid"},
+        {"h264", "h264_cuvid"},
+        {"x264", "h264_cuvid"},
+        {"hevc", "hevc_cuvid"},
+        {"x265", "hevc_cuvid"},
+        {"h265", "hevc_cuvid"},
+        {"mjpeg", "mjpeg_cuvid"},
+        {"mpeg1video", "mpeg1_cuvid"},
+        {"mpeg2video", "mpeg2_cuvid"},
+        {"mpeg4", "mpeg4_cuvid"},
+        {"vc1", "vc1_cuvid"},
+        {"vp8", "vp8_cuvid"},
+        {"vp9", "vp9_cuvid"},
+    };
+    std::string video_decode_hwaccel_info;
+    if (torch::cuda::is_available()) {
+      std::string nv_codec;
+      auto it = codec2nvcodec.cbegin();
+      while (it != codec2nvcodec.cend()) {
+        if (it->first == codec_name || it->second == codec_name) {
+          nv_codec = it->second;
+          break;
+        }
+        ++it;
+      }
+      if (!nv_codec.empty()) {
+        video_decode_hwaccel_info = std::format("-hwaccel cuda -vcodec {} ", nv_codec);
+      }
+    }
+
+    std::string ffmpeg_cmd{std::format(
       "ffmpeg "
       "-loglevel error "
       "{}"
@@ -229,42 +300,37 @@ int main(int argc, char *argv[]) {
       "-pix_fmt bgr24 "
       "-f rawvideo "
       "pipe:",
-      (torch::cuda::is_available()) ? "-hwaccel cuda -vcodec h264_cuvid " : "",
+      video_decode_hwaccel_info,
       input_path
     )};
-    size_t buff_size{3 * 720 * 1280};
-    std::vector<char> buffer(buff_size);
-    int count{0};
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) {
-        throw std::runtime_error("popen() failed!");
-    }
+    std::unique_ptr<FILE, decltype(&pclose)> ffmpeg_pipe(popen(ffmpeg_cmd.c_str(), "r"), pclose);
+    if (!ffmpeg_pipe) throw std::runtime_error("popen() failed!");
 
+    cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), frame_rate, cv::Size(frame_width, frame_height));
+
+    int count{0};
+    int frame_channels{3};
+    int buff_size{frame_channels * frame_height * frame_width};
+    std::vector<char> buffer(buff_size);
+    Ort::RunOptions run_options;
     torch::Tensor classes_to_keep = torch::tensor({0});
     torch::Tensor min_score = torch::tensor(0.65);
-    while (not std::feof(pipe.get())) {
-        std::fread(buffer.data(), 1, buff_size, pipe.get());
-        torch::Tensor frame = torch::from_blob(buffer.data(), {720, 1280, 3}, torch::TensorOptions().dtype(torch::kUInt8));
-        Ort::RunOptions run_options;
-        torch::Tensor input = preprocess_frames(frame.permute({2, 0, 1}).unsqueeze(0), 640, 640);
-        std::array<int64_t, 4> input_shape = {1, 3, 640, 640};
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
-        torch::Tensor output = torch::zeros({1, 5, 8400}, torch::TensorOptions().dtype(torch::kFloat32));
-        std::array<int64_t, 4> output_shape = {1, 5, 8400};
-        Ort::Value output_tensor = Ort::Value::CreateTensor<float>(memory_info, output.data_ptr<float>(), output.numel(), output_shape.data(), 3);
-        session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
-        torch::Tensor boxes;
-        torch::Tensor scores;
-        torch::Tensor classes;
-        std::tie(boxes, scores, classes) = postprocess(output[0], classes_to_keep, min_score, 640, 640);
-
-        cv::Mat mat = cv::Mat(cv::Size(1280, 720), CV_8UC3, frame.data_ptr<uchar>());
-        for (int i = 0; i < boxes.sizes()[0]; ++i) {
-          std::vector<int64_t> box = box_rel2abs(boxes[i], 720, 1280);
-          cv::rectangle(mat, cv::Point2d(box[0], box[1]), cv::Point2d(box[2], box[3]), cv::Scalar(0, 0, 225), 2);
-        }
-        writer.write(mat);
-        count++;
+    torch::Tensor boxes, scores, classes;
+    cv::Scalar cv_color_red{0, 0, 225};
+    while (not std::feof(ffmpeg_pipe.get())) {
+      std::fread(buffer.data(), 1, buff_size, ffmpeg_pipe.get());
+      torch::Tensor frame = torch::from_blob(buffer.data(), {frame_height, frame_width, frame_channels}, torch::TensorOptions().dtype(torch::kUInt8));
+      torch::Tensor input = preprocess_frames(frame.permute({2, 0, 1}).unsqueeze(0), 640, 640);
+      Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input.data_ptr<float>(), input.numel(), input_shape.data(), 4);
+      session.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), &output_tensor, 1);
+      std::tie(boxes, scores, classes) = postprocess(output[0], classes_to_keep, min_score, 640, 640);
+      cv::Mat mat = cv::Mat(cv::Size(frame_width, frame_height), CV_8UC3, frame.data_ptr<uchar>());
+      for (size_t i = 0; i < boxes.sizes()[0]; ++i) {
+        std::vector<int64_t> box = box_rel2abs(boxes[i], frame_height, frame_width);
+        cv::rectangle(mat, cv::Point2d(box[0], box[1]), cv::Point2d(box[2], box[3]), cv_color_red, 2);
+      }
+      writer.write(mat);
+      count++;
     }
     writer.release();
     std::cout << std::format("{}", count) << std::endl;
