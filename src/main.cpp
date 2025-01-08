@@ -1,9 +1,11 @@
-#include <torch/script.h>
+#include <torch/torch.h>
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <format>
 #include <unordered_map>
+#include <vector>
+#include <numeric>
 
 torch::Tensor bgr_to_rgb(torch::Tensor bgr) {
   torch::TensorOptions options = torch::TensorOptions().device(bgr.device()).dtype(bgr.dtype());
@@ -131,7 +133,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> postprocess(
 }
 
 
-enum class ModelExecutionMode : char {CPU, CUDA, TENSORRT};
+enum class InferMode : int {CPU, CUDA, TENSORRT};
 
 
 int main(int argc, char *argv[]) {
@@ -143,31 +145,51 @@ int main(int argc, char *argv[]) {
     std::string model_path(argv[1]);
     std::string input_path(argv[2]);
     std::string output_path(argv[3]);
-    ModelExecutionMode exec_mode{ModelExecutionMode::CPU};
+    InferMode infer_mode{InferMode::CPU};
     if (argc > 4) {
-      std::string exec_mode_arg{argv[4]};
-      exec_mode = std::unordered_map<std::string, ModelExecutionMode>{
-        {"CPU", ModelExecutionMode::CPU},
-        {"CUDA", ModelExecutionMode::CUDA},
-        {"TENSORRT", ModelExecutionMode::TENSORRT}
-      }[exec_mode_arg];
+      std::string infer_mode_arg{argv[4]};
+      std::string infer_mode_arg_unified(infer_mode_arg);
+      std::transform(infer_mode_arg.begin(), infer_mode_arg.end(), infer_mode_arg_unified.begin(), ::toupper);
+      std::unordered_map<std::string, InferMode> infer_mode_map{
+        {"CPU", InferMode::CPU},
+        {"CUDA", InferMode::CUDA},
+        {"TENSORRT", InferMode::TENSORRT}
+      };
+
+      auto search = infer_mode_map.find(infer_mode_arg_unified);
+      if (search == infer_mode_map.end()) {
+        std::vector<std::string> keys(infer_mode_map.size());
+        std::transform(infer_mode_map.begin(), infer_mode_map.end(), keys.begin(), [](std::pair<std::string, InferMode> a) {return a.first;});
+        std::cerr << std::format(
+          "Unknown infer mode: {}. Supported options: {}.\n",
+          infer_mode_arg,
+          std::accumulate(keys.begin() + 1, keys.end(), *keys.begin(), [](std::string a, std::string b) {return a + ", " + b;})
+        );
+        return 1;
+      }
+
+      infer_mode = search->second;
+      if (infer_mode != InferMode::CPU && !torch::cuda::is_available()) {
+        std::cerr << "CUDA GPU computation is not available! Argument infer_modde please select CPU or leave blank.\n";
+        return 1;
+      }
     }
 
     Ort::Env env;
     Ort::MemoryInfo memory_info = 
-      (exec_mode == ModelExecutionMode::CPU)
+      (infer_mode == InferMode::CPU)
       ? Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)
       : Ort::MemoryInfo("Cuda", OrtArenaAllocator, /*device_id*/0, OrtMemTypeDefault);
     Ort::SessionOptions options;
 
     auto cuda_opts = std::make_unique<OrtCUDAProviderOptions>();
     auto trt_opts = std::make_unique<OrtTensorRTProviderOptions>();
-    switch (exec_mode) 
+    switch (infer_mode) 
     {
-      case ModelExecutionMode::CUDA:
+      case InferMode::CUDA:
         options.AppendExecutionProvider_CUDA(*cuda_opts.get());
         break;
-      case ModelExecutionMode::TENSORRT:
+      case InferMode::TENSORRT:
         trt_opts->trt_max_partition_iterations = 1000;
         trt_opts->trt_min_subgraph_size = 1;
         options.AppendExecutionProvider_TensorRT(*trt_opts.get());
