@@ -7,7 +7,7 @@
 #include <vector>
 #include <numeric>
 
-torch::Tensor bgr_to_rgb(torch::Tensor bgr) {
+torch::Tensor bgr_to_rgb(const torch::Tensor& bgr) {
   torch::TensorOptions options = torch::TensorOptions().device(bgr.device()).dtype(bgr.dtype());
   torch::Tensor rgb = torch::zeros(bgr.sizes(), options);
   rgb.select(-3, 0) = bgr.select(-3, 2);
@@ -16,20 +16,20 @@ torch::Tensor bgr_to_rgb(torch::Tensor bgr) {
   return rgb;
 }
 
-torch::Tensor preprocess_frames(torch::Tensor frames, int d_height, int d_width) {
+torch::Tensor preprocess_frames(const torch::Tensor& frames, int d_height, int d_width) {
   return bgr_to_rgb(torch::upsample_bilinear2d(frames, {d_height, d_width}, false)).to(torch::kFloat32).div(255);
 }
 
-torch::Tensor non_maximum_suppression(torch::Tensor* boxes, torch::Tensor* scores, float_t iou_thresh) {
-  torch::TensorOptions nms_tensot_options = torch::TensorOptions().device(boxes->device()).dtype(boxes->dtype());
+torch::Tensor non_maximum_suppression(const torch::Tensor& boxes, const torch::Tensor& scores, float_t iou_thresh) {
+  torch::TensorOptions nms_tensot_options = torch::TensorOptions().device(boxes.device()).dtype(boxes.dtype());
   torch::Tensor iou_threshold = torch::tensor(iou_thresh, nms_tensot_options);
-  torch::Tensor x1 = boxes->select(1, 0);
-  torch::Tensor y1 = boxes->select(1, 1);
-  torch::Tensor x2 = boxes->select(1, 2);
-  torch::Tensor y2 = boxes->select(1, 3);
+  torch::Tensor x1 = boxes.select(1, 0);
+  torch::Tensor y1 = boxes.select(1, 1);
+  torch::Tensor x2 = boxes.select(1, 2);
+  torch::Tensor y2 = boxes.select(1, 3);
 
   torch::Tensor areas = (x2 - x1 + 1) * (y2 - y1 + 1);
-  torch::Tensor order = scores->argsort().flip({0,});
+  torch::Tensor order = scores.argsort().flip({0,});
 
   std::vector<int> keep_vec;
   for (int ord_len = order.sizes()[0]; ord_len > 0; ord_len = order.sizes()[0]) {
@@ -54,7 +54,7 @@ torch::Tensor non_maximum_suppression(torch::Tensor* boxes, torch::Tensor* score
   return torch::tensor(keep_vec);
 }
 
-std::vector<int64_t>box_rel2abs(torch::Tensor rel_box, int64_t frame_h, int64_t frame_w) {
+std::vector<int64_t>box_rel2abs(const torch::Tensor& rel_box, int64_t frame_h, int64_t frame_w) {
   std::vector<int64_t> frame_sizes = {frame_w, frame_h, frame_w, frame_h};
   std::vector<int64_t> abs_box = {0, 0, 0, 0};
 
@@ -89,18 +89,17 @@ std::vector<int64_t>box_rel2abs(torch::Tensor rel_box, int64_t frame_h, int64_t 
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> postprocess(
-    torch::Tensor nn_output,
-    torch::Tensor classes_to_keep,
-    torch::Tensor min_score,
+    const torch::Tensor& nn_output,
+    const torch::Tensor& classes_to_keep,
+    const torch::Tensor& min_score,
     int64_t det_input_h,
     int64_t det_input_w,
     float_t iou_thresh=0.9
 ) {
-  nn_output = nn_output.permute({1, 0});
-
-  torch::Tensor boxes = nn_output.narrow(1, 0, 4);
-  std::tuple<torch::Tensor, torch::Tensor> scores_and_classes = nn_output
-    .narrow(1, 4, nn_output.sizes()[1] - 4)
+  torch::Tensor nn_output_permuted = nn_output.permute({1, 0});
+  torch::Tensor boxes = nn_output_permuted.narrow(1, 0, 4);
+  std::tuple<torch::Tensor, torch::Tensor> scores_and_classes = nn_output_permuted
+    .narrow(1, 4, nn_output_permuted.sizes()[1] - 4)
     .max(1);
   torch::Tensor scores = std::get<0>(scores_and_classes);
   torch::Tensor classes = std::get<1>(scores_and_classes);
@@ -124,7 +123,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> postprocess(
   boxes.slice(1, 2, 3) = (x + w / 2) / det_input_w;  // bottom right x
   boxes.slice(1, 3, 4) = (y + h / 2) / det_input_h;  // bottom right y
 
-  keep = non_maximum_suppression(&boxes, &scores, iou_thresh);
+  keep = non_maximum_suppression(boxes, scores, iou_thresh);
   boxes = boxes.index({keep});
   scores = scores.index({keep});
   classes = classes.index({keep});
@@ -170,7 +169,7 @@ int main(int argc, char *argv[]) {
 
       infer_mode = search->second;
       if (infer_mode != InferMode::CPU && !torch::cuda::is_available()) {
-        std::cerr << "CUDA GPU computation is not available! Argument infer_modde please select CPU or leave blank.\n";
+        std::cerr << "CUDA GPU computation is not available! Please select CPU infer mode or leave the parameter blank.\n";
         return 1;
       }
     }
